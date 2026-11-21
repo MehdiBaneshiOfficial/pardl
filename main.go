@@ -2,10 +2,8 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/tls"
 	_ "embed"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -198,7 +196,7 @@ func newClient(ip string) *http.Client {
 		dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(ip)}
 	}
 	tr := &http.Transport{
-		Proxy:       http.ProxyFromEnvironment,
+		Proxy:       proxyFunc,
 		DialContext: dialer.DialContext,
 		// HTTP/2 را خاموش می‌کنیم تا هر worker واقعاً یک اتصال TCP جدا داشته باشد
 		TLSClientConfig:       &tls.Config{},
@@ -206,7 +204,7 @@ func newClient(ip string) *http.Client {
 		TLSHandshakeTimeout:   15 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		IdleConnTimeout:       30 * time.Second,
-		MaxIdleConnsPerHost:   4,
+		MaxIdleConnsPerHost:   32,
 	}
 	return &http.Client{Transport: tr}
 }
@@ -642,12 +640,21 @@ func openBrowser(u string) {
 
 func main() {
 	cliURL := flag.String("url", "", "حالت خط فرمان: لینک (چند میرور با ویرگول)")
-	conns := flag.Int("n", 16, "تعداد اتصال همزمان")
+	conns := flag.Int("n", 32, "حداکثر اتصال همزمان (در حالت پراکسی، تعداد بهینه خودکار پیدا می‌شود)")
 	chunk := flag.Int("chunk", 2, "اندازه هر تکه (مگابایت)")
 	dir := flag.String("dir", "", "پوشه ذخیره")
 	allIf := flag.Bool("all-ifaces", false, "استفاده از همه شبکه‌های فعال (سیم‌کارت/وای‌فای)")
 	noOpen := flag.Bool("no-browser", false, "مرورگر خودکار باز نشود")
+	port := flag.Int("port", 8899, "پورت پراکسی محلی")
+	noSys := flag.Bool("no-sysproxy", false, "پراکسی سیستم ویندوز خودکار تنظیم نشود")
+	minMB := flag.Int("min", 8, "فقط دانلودهای بزرگ‌تر از این مقدار (MB) شتاب بگیرند")
+	restore := flag.Bool("restore", false, "فقط تنظیمات پراکسی ویندوز را به حالت قبل برگردان")
 	flag.Parse()
+	if *restore {
+		restoreSysProxy()
+		fmt.Println("تنظیمات پراکسی ویندوز بازگردانده شد")
+		return
+	}
 
 	d := &Downloader{}
 
@@ -678,63 +685,5 @@ func main() {
 		}
 	}
 
-	tb := make([]byte, 16)
-	_, _ = rand.Read(tb)
-	token := hex.EncodeToString(tb)
-	page := strings.Replace(uiHTML, "__TOKEN__", token, 1)
-
-	auth := func(h http.HandlerFunc) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			if r.Header.Get("X-Token") != token {
-				http.Error(w, "forbidden", http.StatusForbidden)
-				return
-			}
-			h(w, r)
-		}
-	}
-	writeJSON := func(w http.ResponseWriter, v any) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(v)
-	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = io.WriteString(w, page)
-	})
-	mux.HandleFunc("/api/ifaces", auth(func(w http.ResponseWriter, r *http.Request) { writeJSON(w, listIfaces()) }))
-	mux.HandleFunc("/api/status", auth(func(w http.ResponseWriter, r *http.Request) { writeJSON(w, d.Status()) }))
-	mux.HandleFunc("/api/cancel", auth(func(w http.ResponseWriter, r *http.Request) { d.Cancel(); writeJSON(w, map[string]bool{"ok": true}) }))
-	mux.HandleFunc("/api/start", auth(func(w http.ResponseWriter, r *http.Request) {
-		var cfg Config
-		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&cfg); err != nil {
-			writeJSON(w, map[string]string{"error": "درخواست نامعتبر"})
-			return
-		}
-		if err := d.Start(cfg); err != nil {
-			writeJSON(w, map[string]string{"error": err.Error()})
-			return
-		}
-		writeJSON(w, map[string]bool{"ok": true})
-	}))
-
-	ln, err := net.Listen("tcp", "127.0.0.1:8765")
-	if err != nil {
-		ln, err = net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			fmt.Println("خطا:", err)
-			os.Exit(1)
-		}
-	}
-	addr := "http://" + ln.Addr().String()
-	fmt.Println("ParDL اجرا شد:", addr)
-	fmt.Println("(این پنجره را نبند؛ با بستنش برنامه بسته می‌شود)")
-	if !*noOpen {
-		openBrowser(addr)
-	}
-	_ = http.Serve(ln, mux)
+	runProxyMode(proxyOpts{Port: *port, SysProxy: !*noSys, NoBrowser: *noOpen, Conns: *conns, ChunkMB: *chunk, MinMB: *minMB, AllIfaces: *allIf})
 }
